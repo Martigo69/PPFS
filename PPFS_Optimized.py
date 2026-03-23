@@ -3,27 +3,19 @@ import pandas as pd
 import gmpy2
 import matplotlib.pyplot as plt
 from functools import reduce
-from sklearn.feature_selection import mutual_info_classif
 import Threshold_Paillier as tp
 import time
 import os
+import argparse
+from datetime import datetime
 
 gmpy2.get_context().precision = 100
 
-# Global verbose state
-VERBOSE = False
-_STARTED_AT = None
-
-def _coerce_bool(value) -> bool:
-    """Parse environment variable or string to boolean."""
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-def _log(message: str):
-    """Log message with elapsed time if verbose is enabled."""
-    if not VERBOSE or _STARTED_AT is None:
-        return
-    elapsed = time.perf_counter() - _STARTED_AT
-    print(f"[PPFS +{elapsed:8.2f}s] {message}")
+def _measure(func, *args, **kwargs):
+    """Run a function and return (result, seconds)."""
+    start = time.perf_counter()
+    result = func(*args, **kwargs)
+    return result, (time.perf_counter() - start)
 
 # =====================================================================
 # Configuration
@@ -36,6 +28,16 @@ DATASETS = {
     'parkinsons': ('parkinsons_kmeans.csv', 'status', ['name']),
     'rice': ('rice_binned_kmeans.csv', 'Class', []),
     'wdbc': ('wdbc_binned_kmeans.csv', 'Diagnosis', ['ID'])
+}
+
+
+PARTIES = {
+    'wdbc': 8,
+    'parkinsons': 6,
+    'rice': 2,
+    'beans': 4,
+    'divorce': 14,
+    'diabetes': 3
 }
 
 # =====================================================================
@@ -55,42 +57,51 @@ def paillier_add_accumulate(encrypted_values, n_squared):
         acc = (acc * int(c)) % n_squared
     return acc
 
+def paillier_add_accumulate_parallel(encrypted_values, n_squared):
+    values = encrypted_values if isinstance(encrypted_values, list) else list(encrypted_values)
+    if not values:
+        return 1
+    return paillier_add_accumulate(values, n_squared)
+
+def powmod_vector_parallel(bases, exponents, modulus):
+    pairs = list(zip(bases, exponents))
+    if not pairs:
+        return []
+    return [gmpy2.powmod(int(base), int(exp), modulus) for base, exp in pairs]
+
 # =====================================================================
 # Data Loading
 # =====================================================================
 
-def load_csv_data(filename, target_col, drop_cols=None):
-    _log(f"Loading CSV: {filename}")
+def load_csv_data(filename, target_col, drop_cols=None, num_parties=3):
     df = pd.read_csv(filename, delimiter=',')
     if drop_cols:
         df = df.drop(columns=drop_cols, errors='ignore')
     df = df.apply(lambda s: s.astype(np.int64) if s.name != target_col else s)
     # Keep each partition as a DataFrame (np.array_split would coerce to ndarray).
-    column_chunks = np.array_split(df.columns, 3)
-    partitions = [df.loc[:, list(cols)].copy() for cols in column_chunks if len(cols) > 0]
-    _log(f"Data loaded: {len(partitions)} partitions, {len(df)} rows")
+    column_chunks = np.array_split(df.columns, num_parties)
+    partitions = [df.loc[:, list(cols)].copy() for cols in column_chunks]
     return partitions
 
 def load_dataset(name):
     if name not in DATASETS:
         raise ValueError(f"Unknown dataset: {name}")
     file, target, drops = DATASETS[name]
-    return load_csv_data(file, target, drops), target
+    num_parties = PARTIES.get(name, 3)
+    return load_csv_data(file, target, drops, num_parties=num_parties), target
 
 # =====================================================================
 # Feature Selection Helpers
 # =====================================================================
 
 def get_min_mutual_info_feature(data_parts, target_col):
+    plain_mi_score = compute_mutual_information(data_parts, target_col)
     for part in data_parts:
         if target_col in part.columns:
             feature_cols = [c for c in part.columns if c != target_col]
             if not feature_cols:
                 raise ValueError("No feature columns in target-containing part.")
-            X = part[feature_cols].values
-            y = part[target_col].values
-            mi_scores = mutual_info_classif(X, y, discrete_features=True)
-            return min(dict(zip(feature_cols, mi_scores)), key=lambda k: mi_scores[feature_cols.index(k)])
+            return min(feature_cols, key=lambda c: plain_mi_score.get(c, float("inf")))
     raise ValueError(f"Target column '{target_col}' not found.")
 
 # =====================================================================
@@ -98,7 +109,6 @@ def get_min_mutual_info_feature(data_parts, target_col):
 # =====================================================================
 
 def compute_ranks(data_parts, target_col):
-    _log("Computing ranks")
     ranks = []
     for part in data_parts:
         cols = [c for c in part.columns if c != target_col]
@@ -106,7 +116,6 @@ def compute_ranks(data_parts, target_col):
             ranks.append(part[cols].rank().astype(int))
         else:
             ranks.append(pd.DataFrame(index=part.index))
-    _log(f"Ranks computed: {len(ranks)} partitions")
     return ranks
 
 def encrypt_dataframe(df, system):
@@ -115,21 +124,16 @@ def encrypt_dataframe(df, system):
 
     columns = list(df.columns)
     column_arrays = {col: df[col].to_numpy(copy=False) for col in columns}
-    _log(f"Encrypting {len(columns)} columns with {len(df)} rows")
-
     data = {}
     for col in columns:
         values = column_arrays[col]
         data[col] = [system.encryption(safe_int(v)) for v in values]
-
-    _log(f"Encryption complete for {len(columns)} columns")
     return pd.DataFrame(data, dtype=object)
 
 def encrypt_data_parts(data_parts, system):
     return [encrypt_dataframe(p, system) for p in data_parts]
 
 def compute_squared_ranks(ranked_parts):
-    _log("Computing squared ranks")
     squared_parts = []
     for rp in ranked_parts:
         if rp.empty:
@@ -141,91 +145,131 @@ def compute_squared_ranks(ranked_parts):
             squared_parts.append(rp.map(lambda x: gmpy2.mpz(x) ** 2))
         else:
             squared_parts.append(rp.applymap(lambda x: gmpy2.mpz(x) ** 2))
-    _log(f"Squared ranks computed: {len(squared_parts)} partitions")
     return squared_parts
+
+def precompute_encrypted_mi_indicators(data_parts, target_col, system):
+    target_series = None
+    for p in data_parts:
+        if target_col in p.columns:
+            target_series = p[target_col]
+            break
+    if target_series is None:
+        raise ValueError(f"Target column '{target_col}' not found for MI precomputation")
+
+    feature_items = []
+    for part in data_parts:
+        for col in part.columns:
+            if col == target_col:
+                continue
+            X = part[col]
+            unique_X = pd.unique(X)
+            X_plain_ind = {xv: (X == xv).astype(int).to_numpy() for xv in unique_X}
+            X_enc_ind = {
+                xv: [system.encryption(int(bit)) for bit in X_plain_ind[xv]]
+                for xv in unique_X
+            }
+            feature_items.append((col, unique_X, X_enc_ind))
+    return target_series, feature_items
 
 # =====================================================================
 # Spearman (Plain)
 # =====================================================================
 
 def compute_spearman_correlation(ranked_parts, target_col):
-    _log("Computing Spearman correlation (plain)")
-    # Find which part (if any) has target ranks; fallback: last part
     target_rank = None
     for rp in ranked_parts:
         if target_col in rp.columns:
             target_rank = rp[target_col].astype(int)
             break
-    # If target ranks are not stored separately, cannot proceed
     if target_rank is None:
-        # Assume target in last original part (not ranked); cannot compute -> return empty
-        _log("Target column not found in ranked parts")
         return {}
     n = len(target_rank)
-    denom = n * (n**2 - 1)
-    res = {}
+    sum_y = target_rank.sum()
+    sum_y2 = (target_rank * target_rank).sum()
+    mean_y = sum_y / n
+    correlations = {}
     for rp in ranked_parts:
         for col in rp.columns:
             if col == target_col:
                 continue
             fr = rp[col].astype(int)
-            d2 = (fr - target_rank).apply(lambda d: d * d).sum()
-            res[col] = 1 - (6 * d2) / denom
-    _log(f"Spearman correlation computed: {len(res)} features")
-    return res
+            sum_x = fr.sum()
+            sum_x2 = (fr * fr).sum()
+            sum_xy = (fr * target_rank).sum()
+            mean_x = sum_x / n
+            num = sum_xy - n * mean_x * mean_y
+            den = np.sqrt((sum_x2 - n * mean_x * mean_x) * (sum_y2 - n * mean_y * mean_y))
+            if den != 0:
+                correlations[col] = num / den
+            else:
+                correlations[col] = 0.0
+    return correlations
 
 # =====================================================================
 # Spearman (Encrypted Approximation)
 # =====================================================================
 
 def compute_encrypted_spearman_correlation(enc_ranked_parts, enc_squared_parts, ranked_parts, target_col, system):
-    _log("Computing Spearman correlation (encrypted)")
-    n = len(enc_ranked_parts[0]) if enc_ranked_parts else 0
+    if not enc_ranked_parts or not ranked_parts:
+        return {}
+    n = len(enc_ranked_parts[0])
     if n == 0:
         return {}
-    # target rank plaintext (assumed in last ranked part context)
-    target_plain = None
-    if ranked_parts:
-        for rp in ranked_parts:
-            if target_col in rp.columns:
-                target_plain = rp[target_col]
-                break
+    target_plain = next((rp[target_col] for rp in ranked_parts if target_col in rp.columns), None)
     if target_plain is None:
-        _log("Target column not found in ranked parts")
         return {}
+
     n_squared = system.n_squared
-    target_sq_enc_product = None
-    # Locate target column squared encryption (choose last occurrence)
-    for idx, sq in enumerate(enc_squared_parts[::-1]):
-        if target_col in sq.columns:
-            target_sq_enc_product = paillier_add_accumulate(sq[target_col], n_squared)
-            break
-    if target_sq_enc_product is None:
+
+    enc_sum_y2 = next(
+        (paillier_add_accumulate_parallel(sq[target_col].tolist(), n_squared)
+         for sq in reversed(enc_squared_parts) if target_col in sq.columns),
+        None
+    )
+    enc_sum_y = next(
+        (paillier_add_accumulate_parallel(rp[target_col].tolist(), n_squared)
+         for rp in reversed(enc_ranked_parts) if target_col in rp.columns),
+        None
+    )
+    if enc_sum_y is None or enc_sum_y2 is None:
         return {}
-    denom = n * (n**2 - 1)
+
+    mean_y = gmpy2.mpfr(system.combining_algorithm(enc_sum_y, [1, 2])) / gmpy2.mpfr(n)
+    sum_y2 = gmpy2.mpfr(system.combining_algorithm(enc_sum_y2, [1, 2]))
+    target_plain_values = target_plain.to_numpy(copy=False)
+
+    args_list = []
+    for rp, sq in zip(enc_ranked_parts, enc_squared_parts):
+        for col in rp.columns:
+            if col != target_col:
+                args_list.append((rp, sq, col))
+
+    def process_column(args):
+        rp, sq, col = args
+        fr = rp[col].to_numpy(copy=False)
+        fr2 = sq[col] if col in sq.columns else None
+        if fr2 is None:
+            return (col, 0.0)
+        fr2_values = fr2.to_numpy(copy=False)
+
+        enc_xy = powmod_vector_parallel(fr, target_plain_values, n_squared)
+        enc_sum_x = paillier_add_accumulate_parallel(fr.tolist(), n_squared)
+        enc_sum_x2 = paillier_add_accumulate_parallel(fr2_values.tolist(), n_squared)
+        enc_sum_xy = paillier_add_accumulate_parallel(enc_xy, n_squared)
+
+        mean_x = gmpy2.mpfr(system.combining_algorithm(enc_sum_x, [1, 2])) / gmpy2.mpfr(n)
+        sum_x2 = gmpy2.mpfr(system.combining_algorithm(enc_sum_x2, [1, 2]))
+        sum_xy = gmpy2.mpfr(system.combining_algorithm(enc_sum_xy, [1, 2]))
+
+        num = sum_xy - gmpy2.mpfr(n) * mean_x * mean_y
+        den = gmpy2.sqrt((sum_x2 - gmpy2.mpfr(n) * mean_x ** 2) * (sum_y2 - gmpy2.mpfr(n) * mean_y ** 2))
+        corr = float(num / den) if den != 0 else 0.0
+        return (col, corr)
+
     correlations = {}
-    for part_idx, part in enumerate(enc_ranked_parts):
-        sq_part = enc_squared_parts[part_idx]
-        for col in part.columns:
-            if col == target_col:
-                continue
-            if col not in sq_part.columns:
-                continue
-            sum_feature_sq = paillier_add_accumulate(sq_part[col], n_squared)
-            sum_feature_target = 1
-            feature_enc_series = part[col]
-            for i in range(n):
-                enc_r1 = int(feature_enc_series.iloc[i])
-                r2 = int(target_plain.iloc[i])
-                # homomorphic scalar mult: E(x)^k
-                enc_scaled = pow(enc_r1, 2 * r2, n_squared)
-                sum_feature_target = (sum_feature_target * enc_scaled) % n_squared
-            # decrypt
-            num_plain = system.combining_algorithm((sum_feature_sq * target_sq_enc_product) % n_squared, [1, 2])
-            den_plain = system.combining_algorithm(sum_feature_target, [1, 2])
-            d_squared = num_plain - den_plain
-            correlations[col] = 1 - (6 * d_squared) / denom
-    _log(f"Encrypted Spearman correlation computed: {len(correlations)} features")
+    for args in args_list:
+        col, corr = process_column(args)
+        correlations[col] = corr
     return correlations
 
 # =====================================================================
@@ -233,7 +277,6 @@ def compute_encrypted_spearman_correlation(enc_ranked_parts, enc_squared_parts, 
 # =====================================================================
 
 def compute_mutual_information(data_parts, target_col):
-    _log("Computing mutual information (plain)")
     # Locate target column
     target_series = None
     for p in data_parts:
@@ -241,7 +284,6 @@ def compute_mutual_information(data_parts, target_col):
             target_series = p[target_col]
             break
     if target_series is None:
-        _log("Target column not found")
         return {}
     n = len(target_series)
     unique_Y = pd.unique(target_series)
@@ -280,19 +322,37 @@ def compute_mutual_information(data_parts, target_col):
 # Mutual Information (Encrypted Approximation)
 # =====================================================================
 
-def compute_encrypted_mutual_information(data_parts, target_col, system):
-    _log("Computing mutual information (encrypted)")
-    target_series = None
-    for p in data_parts:
-        if target_col in p.columns:
-            target_series = p[target_col]
-            break
-    if target_series is None:
-        _log("Target column not found")
-        return {}
+def compute_encrypted_mutual_information(data_parts, target_col, system, precomputed_indicators=None):
+    if precomputed_indicators is None:
+        target_series = None
+        for p in data_parts:
+            if target_col in p.columns:
+                target_series = p[target_col]
+                break
+        if target_series is None:
+            return {}
+
+        feature_items = []
+        for part in data_parts:
+            for col in part.columns:
+                if col == target_col:
+                    continue
+                X = part[col]
+                unique_X = pd.unique(X)
+                X_plain_ind = {xv: (X == xv).astype(int).to_numpy() for xv in unique_X}
+                X_enc_ind = {
+                    xv: [system.encryption(int(bit)) for bit in X_plain_ind[xv]]
+                    for xv in unique_X
+                }
+                feature_items.append((col, unique_X, X_enc_ind))
+    else:
+        target_series, feature_items = precomputed_indicators
+
     n = len(target_series)
     unique_Y = pd.unique(target_series)
     Y_plain_ind = {y: (target_series == y).astype(int).to_numpy() for y in unique_Y}
+    # Precompute row indices for each class (Y-index optimization for security-preserving speed)
+    Y_indices = {y: np.flatnonzero(Y_plain_ind[y]).tolist() for y in unique_Y}
     # H(Y)
     H_y = gmpy2.mpfr(0)
     for y in unique_Y:
@@ -301,45 +361,32 @@ def compute_encrypted_mutual_information(data_parts, target_col, system):
             H_y -= py * log2_safe(py)
     n_squared = system.n_squared
     mi = {}
-    for part in data_parts:
-        for col in part.columns:
-            if col == target_col:
+    for col, unique_X, X_enc_ind in feature_items:
+        # Count_x using homomorphic addition (product of ciphertexts)
+        count_x = {}
+        for xv in unique_X:
+            chain = paillier_add_accumulate(X_enc_ind[xv], n_squared)
+            count_x[xv] = system.combining_algorithm(chain, [1, 2])
+
+        H_y_given_x = gmpy2.mpfr(0)
+        for xv in unique_X:
+            cx = count_x[xv]
+            if cx == 0:
                 continue
-            X = part[col]
-            unique_X = pd.unique(X)
-            X_plain_ind = {xv: (X == xv).astype(int).to_numpy() for xv in unique_X}
-            # Encrypt indicators row-wise once
-            X_enc_ind = {
-                xv: [system.encryption(int(bit)) for bit in X_plain_ind[xv]]
-                for xv in unique_X
-            }
-            # Count_x using homomorphic addition (product of ciphertexts)
-            count_x = {}
-            for xv in unique_X:
-                chain = paillier_add_accumulate(X_enc_ind[xv], n_squared)
-                count_x[xv] = system.combining_algorithm(chain, [1, 2])
-            H_y_given_x = gmpy2.mpfr(0)
-            for xv in unique_X:
-                cx = count_x[xv]
-                if cx == 0:
+            enc_vector = X_enc_ind[xv]
+            for y in unique_Y:
+                # Multiply encrypted 1_{X=xv} ciphertexts only where Y=y (using Y_indices)
+                sel_product = 1
+                for i in Y_indices[y]:
+                    sel_product = (sel_product * int(enc_vector[i])) % n_squared
+                c_xy = system.combining_algorithm(sel_product, [1, 2])
+                if c_xy == 0:
                     continue
-                enc_vector = X_enc_ind[xv]
-                for y in unique_Y:
-                    # Multiply encrypted 1_{X=xv} ciphertexts only where Y= y
-                    sel_product = 1
-                    y_mask = Y_plain_ind[y]
-                    for i, bit in enumerate(y_mask):
-                        if bit == 1:
-                            sel_product = (sel_product * int(enc_vector[i])) % n_squared
-                    c_xy = system.combining_algorithm(sel_product, [1, 2])
-                    if c_xy == 0:
-                        continue
-                    p_xy = gmpy2.mpfr(c_xy) / n
-                    p_y_given_x = gmpy2.mpfr(c_xy) / cx if cx else gmpy2.mpfr(0)
-                    if p_y_given_x > 0:
-                        H_y_given_x -= p_xy * log2_safe(p_y_given_x)
-            mi[col] = float(H_y - H_y_given_x)
-    _log(f"Encrypted mutual information computed: {len(mi)} features")
+                p_xy = gmpy2.mpfr(c_xy) / n
+                p_y_given_x = gmpy2.mpfr(c_xy) / cx if cx else gmpy2.mpfr(0)
+                if p_y_given_x > 0:
+                    H_y_given_x -= p_xy * log2_safe(p_y_given_x)
+        mi[col] = float(H_y - H_y_given_x)
     return mi
 
 # =====================================================================
@@ -352,7 +399,16 @@ def print_spearman_results(target_feature, plain_corrs, enc_corrs):
     for f, v in plain_corrs.items():
         print(f"{f:<25}{v:<22}{enc_corrs.get(f, None)}")
 
-def plot_elbow(values_dict, title, ylabel):
+def _format_spearman_results(target_feature, plain_corrs, enc_corrs):
+    lines = [
+        f"Target Feature (Spearman): {target_feature}",
+        f"{'Feature':<25}{'Plain':<22}{'Encrypted'}",
+    ]
+    for f, v in plain_corrs.items():
+        lines.append(f"{f:<25}{v:<22}{enc_corrs.get(f, None)}")
+    return "\n".join(lines)
+
+def plot_elbow(values_dict, title, ylabel, dataset_name="unknown"):
     if not values_dict:
         return
     sorted_items = sorted(values_dict.items(), key=lambda x: abs(x[1]), reverse=True)
@@ -364,7 +420,12 @@ def plot_elbow(values_dict, title, ylabel):
     plt.ylabel(ylabel)
     plt.xlabel("Features")
     plt.tight_layout()
-    plt.show()
+    os.makedirs("Output", exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_dataset = str(dataset_name).strip().replace(" ", "_")
+    filename = os.path.join("Output", f"plot_spearman_{safe_dataset}_{ts}.png")
+    plt.savefig(filename, dpi=100, bbox_inches='tight')
+    plt.close()
 
 def print_mutual_info_results(target_col, plain_mi, enc_mi):
     print(f"\nMutual Information (target={target_col})")
@@ -372,7 +433,122 @@ def print_mutual_info_results(target_col, plain_mi, enc_mi):
     for f, v in plain_mi.items():
         print(f"{f:<25}{v:<22}{enc_mi.get(f, None)}")
 
-def plot_mi(mi_dict, title):
+def _format_mutual_info_results(target_col, plain_mi, enc_mi):
+    lines = [
+        f"Mutual Information (target={target_col})",
+        f"{'Feature':<25}{'Plain':<22}{'Encrypted'}",
+    ]
+    for f, v in plain_mi.items():
+        lines.append(f"{f:<25}{v:<22}{enc_mi.get(f, None)}")
+    return "\n".join(lines)
+
+def _format_timing_table(rows):
+    headers = [
+        "Dataset",
+        "Spearman Preprocess (s)",
+        "Enc Spearman Compute (s)",
+        "MI Preprocess (s)",
+        "Enc MI Compute (s)",
+    ]
+    body = []
+    for r in rows:
+        body.append([
+            r["dataset"],
+            f"{r['spearman_preprocess_s']:.3f}",
+            f"{r['enc_spearman_s']:.3f}",
+            f"{r['mi_preprocess_s']:.3f}",
+            f"{r['enc_mi_s']:.3f}",
+        ])
+
+    widths = [len(h) for h in headers]
+    for row in body:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def _line(values):
+        return " | ".join(values[i].ljust(widths[i]) for i in range(len(values)))
+
+    sep = "-+-".join("-" * w for w in widths)
+    lines = [_line(headers), sep]
+    lines.extend(_line(row) for row in body)
+    return "\n".join(lines)
+
+def _run_single_dataset(dataset_name, make_plots=True, emit_console=True):
+    num_parties = PARTIES.get(dataset_name, 3)
+    threshold = 2
+    system = tp.ThresholdPaillierCorrectProtocol(threshold=threshold, num_parties=num_parties)
+
+    data_parts, target_col = load_dataset(dataset_name)
+    target_feature = get_min_mutual_info_feature(data_parts, target_col)
+    row_count = len(data_parts[0]) if data_parts else 0
+    total_columns = sum(len(p.columns) for p in data_parts)
+
+    dataset_info_lines = [
+        f"Dataset: {dataset_name}",
+        f"Parties: {num_parties}",
+        f"Threshold: {threshold}",
+        f"Rows: {row_count}",
+        f"Columns: {total_columns}",
+        f"Target Column: {target_col}",
+        "",
+    ]
+
+    spearman_preprocess_start = time.perf_counter()
+    ranked_parts = compute_ranks(data_parts, target_col)
+    squared_ranks = compute_squared_ranks(ranked_parts)
+    enc_ranked_parts = encrypt_data_parts(ranked_parts, system)
+    enc_squared_parts = encrypt_data_parts(squared_ranks, system)
+    spearman_preprocess_s = time.perf_counter() - spearman_preprocess_start
+
+    mi_preprocess_start = time.perf_counter()
+    enc_mi_indicators = precompute_encrypted_mi_indicators(data_parts, target_col, system)
+    mi_preprocess_s = time.perf_counter() - mi_preprocess_start
+    plain_spearman = compute_spearman_correlation(ranked_parts, target_feature)
+    enc_spearman, enc_spearman_s = _measure(
+        compute_encrypted_spearman_correlation,
+        enc_ranked_parts,
+        enc_squared_parts,
+        ranked_parts,
+        target_feature,
+        system,
+    )
+    plain_mi = compute_mutual_information(data_parts, target_col)
+    enc_mi, enc_mi_s = _measure(
+        compute_encrypted_mutual_information,
+        data_parts,
+        target_col,
+        system,
+        enc_mi_indicators,
+    )
+
+    spearman_text = _format_spearman_results(target_feature, plain_spearman, enc_spearman)
+    mi_text = _format_mutual_info_results(target_col, plain_mi, enc_mi)
+
+    if emit_console:
+        print(spearman_text)
+        if make_plots:
+            plot_elbow(enc_spearman, f"Encrypted Spearman (Dataset={dataset_name}, Target={target_feature})", "Abs Spearman", dataset_name)
+        print("\n" + mi_text)
+        if make_plots:
+            plot_mi(enc_mi, f"Encrypted MI (Dataset={dataset_name}, Target={target_col})", dataset_name)
+
+    return {
+        "dataset": dataset_name,
+        "spearman_preprocess_s": spearman_preprocess_s,
+        "enc_spearman_s": enc_spearman_s,
+        "mi_preprocess_s": mi_preprocess_s,
+        "enc_mi_s": enc_mi_s,
+        "details": [
+            f"=== Dataset: {dataset_name} ===",
+            *dataset_info_lines,
+            spearman_text,
+            "",
+            mi_text,
+            "",
+        ],
+    }
+
+def plot_mi(mi_dict, title, dataset_name="unknown"):
     if not mi_dict:
         return
     sorted_items = sorted(mi_dict.items(), key=lambda x: x[1], reverse=True)
@@ -384,54 +560,154 @@ def plot_mi(mi_dict, title):
     plt.ylabel("Mutual Information")
     plt.xlabel("Features")
     plt.tight_layout()
-    plt.show()
+    os.makedirs("Output", exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_dataset = str(dataset_name).strip().replace(" ", "_")
+    filename = os.path.join("Output", f"plot_mi_{safe_dataset}_{ts}.png")
+    plt.savefig(filename, dpi=100, bbox_inches='tight')
+    plt.close()
+
+def generate_plots_from_report(report_path):
+    with open(report_path, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+
+    datasets = []
+    current = None
+    i = 0
+
+    while i < len(lines):
+        line = lines[i].strip()
+
+        if line.startswith("=== Dataset: ") and line.endswith(" ==="):
+            if current is not None:
+                datasets.append(current)
+            name = line[len("=== Dataset: "):-len(" ===")].strip()
+            current = {"dataset": name, "spearman": {}, "mi": {}, "target_feature": None, "target_col": None}
+            i += 1
+            continue
+
+        if current is None:
+            i += 1
+            continue
+
+        if line.startswith("Target Feature (Spearman):"):
+            current["target_feature"] = line.split(":", 1)[1].strip()
+            i += 2  # skip table header line
+            while i < len(lines) and lines[i].strip():
+                row = lines[i].split()
+                if len(row) >= 3:
+                    feature = row[0]
+                    current["spearman"][feature] = float(row[-1])
+                i += 1
+            continue
+
+        if line.startswith("Mutual Information (target=") and line.endswith(")"):
+            current["target_col"] = line[len("Mutual Information (target="):-1].strip()
+            i += 2  # skip table header line
+            while i < len(lines) and lines[i].strip():
+                row = lines[i].split()
+                if len(row) >= 3:
+                    feature = row[0]
+                    current["mi"][feature] = float(row[-1])
+                i += 1
+            continue
+
+        i += 1
+
+    if current is not None:
+        datasets.append(current)
+
+    if not datasets:
+        raise ValueError(f"No dataset sections found in report: {report_path}")
+
+    os.makedirs("Output", exist_ok=True)
+    for d in datasets:
+        ds = d["dataset"]
+        if d["spearman"]:
+            target_feature = d["target_feature"] if d["target_feature"] else "target"
+            plot_elbow(
+                d["spearman"],
+                f"Encrypted Spearman (Dataset={ds}, Target={target_feature})",
+                "Abs Spearman",
+                ds,
+            )
+        if d["mi"]:
+            target_col = d["target_col"] if d["target_col"] else "target"
+            plot_mi(d["mi"], f"Encrypted MI (Dataset={ds}, Target={target_col})", ds)
 
 # =====================================================================
 # Main
 # =====================================================================
 
-def main(dataset_name='diabetes', verbose=None):
-    global VERBOSE, _STARTED_AT
-    
-    # Parse verbose flag from parameter or environment
-    env_verbose = os.getenv("PPFS_VERBOSE", "0")
-    VERBOSE = verbose if verbose is not None else _coerce_bool(env_verbose)
-    _STARTED_AT = time.perf_counter()
-    
-    _log(f"Starting PPFS on dataset: {dataset_name}")
-    
-    system = tp.ThresholdPaillierCorrectProtocol(threshold=2, num_parties=3, verbose=VERBOSE)
-    data_parts, target_col = load_dataset(dataset_name)
+def main(dataset_name='diabetes', run_all=False, output_path=None):
+    selected_all = run_all or str(dataset_name).strip().lower() == "all"
 
-    target_feature = get_min_mutual_info_feature(data_parts, target_col)
-    _log(f"Target feature: {target_feature}")
-    ranked_parts = compute_ranks(data_parts, target_col)
-    squared_ranks = compute_squared_ranks(ranked_parts)
+    if selected_all:
+        rows = []
+        report_lines = ["PPFS Benchmark Report", f"Generated at: {datetime.now().isoformat(timespec='seconds')}", ""]
+        for name in DATASETS.keys():
+            row = _run_single_dataset(name, make_plots=False, emit_console=False)
+            rows.append(row)
+            report_lines.extend(row["details"])
 
-    # Encrypt ranks & squared ranks
-    _log("Encrypting ranked parts")
-    enc_ranked_parts = encrypt_data_parts(ranked_parts, system)
-    _log("Encrypting squared ranks")
-    enc_squared_parts = encrypt_data_parts(squared_ranks, system)
+        table = _format_timing_table(rows)
+        report_lines.insert(3, "Timing Summary")
+        report_lines.insert(4, table)
+        report_lines.insert(5, "")
 
-    # Spearman
-    _log("Computing Spearman correlation")
-    plain_spearman = compute_spearman_correlation(ranked_parts, target_feature)
-    enc_spearman = compute_encrypted_spearman_correlation(
-        enc_ranked_parts, enc_squared_parts, ranked_parts, target_feature, system
-    )
-    print_spearman_results(target_feature, plain_spearman, enc_spearman)
-    plot_elbow(enc_spearman, f"Encrypted Spearman (Dataset={dataset_name}, Target={target_feature})", "Abs Spearman")
+        if output_path is None:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = f"ppfs_all_datasets_report_{ts}.txt"
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(report_lines))
+        return {"mode": "all", "output_path": output_path, "timings": rows}
 
-    # Mutual Information
-    _log("Computing mutual information")
-    plain_mi = compute_mutual_information(data_parts, target_col)
-    enc_mi = compute_encrypted_mutual_information(data_parts, target_col, system)
-    print_mutual_info_results(target_col, plain_mi, enc_mi)
-    plot_mi(enc_mi, f"Encrypted MI (Dataset={dataset_name}, Target={target_col})")
-    
-    _log("PPFS analysis complete")
+    row = _run_single_dataset(dataset_name, make_plots=True, emit_console=True)
+    print("\nTiming Summary")
+    timing_table = _format_timing_table([row])
+    print(timing_table)
+
+    if output_path is not None:
+        report_lines = [
+            "PPFS Benchmark Report",
+            f"Generated at: {datetime.now().isoformat(timespec='seconds')}",
+            "",
+            "Timing Summary",
+            timing_table,
+            "",
+        ]
+        report_lines.extend(row["details"])
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(report_lines))
+        return {"mode": "single", "output_path": output_path, "timings": [row]}
+
+    return {"mode": "single", "timings": [row]}
 
 if __name__ == "__main__":
-    # Set verbose=True for live progress, or use PPFS_VERBOSE=1 environment variable
-    main('divorce', verbose=True)
+    parser = argparse.ArgumentParser(description="PPFS runner with timing summary.")
+    parser.add_argument("--dataset", default="diabetes", help="Dataset name or 'all'.")
+    parser.add_argument("--mode", choices=["single", "all"], default="single", help="Run one dataset or all datasets.")
+    parser.add_argument("--output", action="store_true", help="Write report to Output directory.")
+    parser.add_argument("--plot-report", default=None, help="Generate plots from an existing report file and exit.")
+    args = parser.parse_args()
+
+    if args.plot_report:
+        generate_plots_from_report(args.plot_report)
+        print("Plots generated from report and saved in Output directory.")
+        raise SystemExit(0)
+
+    run_all = args.mode == "all" or str(args.dataset).strip().lower() == "all"
+    output_path = None
+    if args.output:
+        os.makedirs("Output", exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if run_all:
+            output_path = os.path.join("Output", f"ppfs_all_datasets_report_{ts}.txt")
+        else:
+            dataset_tag = str(args.dataset).strip().lower().replace(" ", "_")
+            output_path = os.path.join("Output", f"ppfs_{dataset_tag}_report_{ts}.txt")
+
+    result = main(dataset_name=args.dataset, run_all=run_all, output_path=output_path)
+
+    if run_all and result.get("output_path"):
+        print(f"All-datasets report written to: {result['output_path']}")
