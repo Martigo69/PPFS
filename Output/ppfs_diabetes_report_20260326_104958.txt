@@ -1,0 +1,36 @@
+PPFS Benchmark Report
+Generated at: 2026-03-26T12:11:57
+
+Timing Summary
+Dataset  | Spearman Preprocess (s) | Enc Spearman Compute (s) | MI Preprocess (s) | Enc MI Compute (s)
+---------+-------------------------+--------------------------+-------------------+-------------------
+diabetes | 1462.354                | 5.022                    | 3005.509          | 42.417            
+
+=== Dataset: diabetes ===
+Dataset: diabetes
+Parties: 3
+Threshold: 2
+Rows: 768
+Columns: 9
+Target Column: Outcome
+
+Target Feature (Spearman): DiabetesPedigreeFunction
+Feature                  Plain                 Encrypted
+Pregnancies              -0.04603966358699267  -0.046039663586992824
+Glucose                  0.10309609084897267   0.10309609084897267
+BloodPressure            0.01908619811604143   0.019086198116041144
+SkinThickness            0.1846516431032768    0.1846516431032767
+Insulin                  0.21469476082425612   0.21469476082425581
+BMI                      0.1404365687528146    0.1404365687528146
+Age                      0.03545689313425084   0.03545689313425084
+
+Mutual Information (target=Outcome)
+Feature                  Plain                 Encrypted
+Pregnancies              0.04791176873782734   0.04791176873782734
+Glucose                  0.18857888822030613   0.18857888822030613
+BloodPressure            0.02756790518046095   0.02756790518046095
+SkinThickness            0.04315827716728417   0.04315827716728417
+Insulin                  0.05990375098362576   0.05990375098362576
+BMI                      0.09043066514352194   0.09043066514352194
+DiabetesPedigreeFunction 0.033205036615844286  0.033205036615844286
+Age                      0.0823173699376249    0.0823173699376249

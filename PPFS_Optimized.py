@@ -78,7 +78,6 @@ def load_csv_data(filename, target_col, drop_cols=None, num_parties=3):
     if drop_cols:
         df = df.drop(columns=drop_cols, errors='ignore')
     df = df.apply(lambda s: s.astype(np.int64) if s.name != target_col else s)
-    # Keep each partition as a DataFrame (np.array_split would coerce to ndarray).
     column_chunks = np.array_split(df.columns, num_parties)
     partitions = [df.loc[:, list(cols)].copy() for cols in column_chunks]
     return partitions
@@ -140,7 +139,6 @@ def compute_squared_ranks(ranked_parts):
             squared_parts.append(rp.copy())
             continue
 
-        # pandas 3.x removed applymap; use map when available.
         if hasattr(rp, "map"):
             squared_parts.append(rp.map(lambda x: gmpy2.mpz(x) ** 2))
         else:
@@ -351,7 +349,6 @@ def compute_encrypted_mutual_information(data_parts, target_col, system, precomp
     n = len(target_series)
     unique_Y = pd.unique(target_series)
     Y_plain_ind = {y: (target_series == y).astype(int).to_numpy() for y in unique_Y}
-    # Precompute row indices for each class (Y-index optimization for security-preserving speed)
     Y_indices = {y: np.flatnonzero(Y_plain_ind[y]).tolist() for y in unique_Y}
     # H(Y)
     H_y = gmpy2.mpfr(0)
@@ -362,7 +359,6 @@ def compute_encrypted_mutual_information(data_parts, target_col, system, precomp
     n_squared = system.n_squared
     mi = {}
     for col, unique_X, X_enc_ind in feature_items:
-        # Count_x using homomorphic addition (product of ciphertexts)
         count_x = {}
         for xv in unique_X:
             chain = paillier_add_accumulate(X_enc_ind[xv], n_squared)
@@ -375,7 +371,6 @@ def compute_encrypted_mutual_information(data_parts, target_col, system, precomp
                 continue
             enc_vector = X_enc_ind[xv]
             for y in unique_Y:
-                # Multiply encrypted 1_{X=xv} ciphertexts only where Y=y (using Y_indices)
                 sel_product = 1
                 for i in Y_indices[y]:
                     sel_product = (sel_product * int(enc_vector[i])) % n_squared
@@ -474,12 +469,14 @@ def _format_timing_table(rows):
     return "\n".join(lines)
 
 def _run_single_dataset(dataset_name, make_plots=True, emit_console=True):
+    protocol_preprocess_start = time.perf_counter()
     num_parties = PARTIES.get(dataset_name, 3)
     threshold = 2
     system = tp.ThresholdPaillierCorrectProtocol(threshold=threshold, num_parties=num_parties)
 
     data_parts, target_col = load_dataset(dataset_name)
     target_feature = get_min_mutual_info_feature(data_parts, target_col)
+    shared_preprocess_s = time.perf_counter() - protocol_preprocess_start
     row_count = len(data_parts[0]) if data_parts else 0
     total_columns = sum(len(p.columns) for p in data_parts)
 
@@ -498,11 +495,11 @@ def _run_single_dataset(dataset_name, make_plots=True, emit_console=True):
     squared_ranks = compute_squared_ranks(ranked_parts)
     enc_ranked_parts = encrypt_data_parts(ranked_parts, system)
     enc_squared_parts = encrypt_data_parts(squared_ranks, system)
-    spearman_preprocess_s = time.perf_counter() - spearman_preprocess_start
+    spearman_preprocess_s = shared_preprocess_s + (time.perf_counter() - spearman_preprocess_start)
 
     mi_preprocess_start = time.perf_counter()
     enc_mi_indicators = precompute_encrypted_mi_indicators(data_parts, target_col, system)
-    mi_preprocess_s = time.perf_counter() - mi_preprocess_start
+    mi_preprocess_s = shared_preprocess_s + (time.perf_counter() - mi_preprocess_start)
     plain_spearman = compute_spearman_correlation(ranked_parts, target_feature)
     enc_spearman, enc_spearman_s = _measure(
         compute_encrypted_spearman_correlation,
@@ -567,74 +564,6 @@ def plot_mi(mi_dict, title, dataset_name="unknown"):
     plt.savefig(filename, dpi=100, bbox_inches='tight')
     plt.close()
 
-def generate_plots_from_report(report_path):
-    with open(report_path, "r", encoding="utf-8") as f:
-        lines = f.read().splitlines()
-
-    datasets = []
-    current = None
-    i = 0
-
-    while i < len(lines):
-        line = lines[i].strip()
-
-        if line.startswith("=== Dataset: ") and line.endswith(" ==="):
-            if current is not None:
-                datasets.append(current)
-            name = line[len("=== Dataset: "):-len(" ===")].strip()
-            current = {"dataset": name, "spearman": {}, "mi": {}, "target_feature": None, "target_col": None}
-            i += 1
-            continue
-
-        if current is None:
-            i += 1
-            continue
-
-        if line.startswith("Target Feature (Spearman):"):
-            current["target_feature"] = line.split(":", 1)[1].strip()
-            i += 2  # skip table header line
-            while i < len(lines) and lines[i].strip():
-                row = lines[i].split()
-                if len(row) >= 3:
-                    feature = row[0]
-                    current["spearman"][feature] = float(row[-1])
-                i += 1
-            continue
-
-        if line.startswith("Mutual Information (target=") and line.endswith(")"):
-            current["target_col"] = line[len("Mutual Information (target="):-1].strip()
-            i += 2  # skip table header line
-            while i < len(lines) and lines[i].strip():
-                row = lines[i].split()
-                if len(row) >= 3:
-                    feature = row[0]
-                    current["mi"][feature] = float(row[-1])
-                i += 1
-            continue
-
-        i += 1
-
-    if current is not None:
-        datasets.append(current)
-
-    if not datasets:
-        raise ValueError(f"No dataset sections found in report: {report_path}")
-
-    os.makedirs("Output", exist_ok=True)
-    for d in datasets:
-        ds = d["dataset"]
-        if d["spearman"]:
-            target_feature = d["target_feature"] if d["target_feature"] else "target"
-            plot_elbow(
-                d["spearman"],
-                f"Encrypted Spearman (Dataset={ds}, Target={target_feature})",
-                "Abs Spearman",
-                ds,
-            )
-        if d["mi"]:
-            target_col = d["target_col"] if d["target_col"] else "target"
-            plot_mi(d["mi"], f"Encrypted MI (Dataset={ds}, Target={target_col})", ds)
-
 # =====================================================================
 # Main
 # =====================================================================
@@ -643,23 +572,43 @@ def main(dataset_name='diabetes', run_all=False, output_path=None):
     selected_all = run_all or str(dataset_name).strip().lower() == "all"
 
     if selected_all:
-        rows = []
-        report_lines = ["PPFS Benchmark Report", f"Generated at: {datetime.now().isoformat(timespec='seconds')}", ""]
-        for name in DATASETS.keys():
-            row = _run_single_dataset(name, make_plots=False, emit_console=False)
-            rows.append(row)
-            report_lines.extend(row["details"])
-
-        table = _format_timing_table(rows)
-        report_lines.insert(3, "Timing Summary")
-        report_lines.insert(4, table)
-        report_lines.insert(5, "")
-
         if output_path is None:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = f"ppfs_all_datasets_report_{ts}.txt"
+
+        rows = []
+        details_blocks = []
+        dataset_names = list(DATASETS.keys())
+
+        # Create the report file early so progress is visible while long runs are in progress.
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(report_lines))
+            f.write("PPFS Benchmark Report\n")
+            f.write(f"Generated at: {datetime.now().isoformat(timespec='seconds')}\n\n")
+            f.write("Timing Summary\n")
+            f.write("(in progress)\n\n")
+
+        for idx, name in enumerate(dataset_names, start=1):
+            row = _run_single_dataset(name, make_plots=False, emit_console=False)
+            rows.append(row)
+            details_blocks.extend(row["details"])
+
+            table = _format_timing_table(rows)
+            report_lines = [
+                "PPFS Benchmark Report",
+                f"Generated at: {datetime.now().isoformat(timespec='seconds')}",
+                "",
+                "Timing Summary",
+                table,
+                "",
+                f"Progress: {idx}/{len(dataset_names)} datasets completed",
+                "",
+            ]
+            report_lines.extend(details_blocks)
+
+            # Rewrite full report after each dataset completion for live monitoring.
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(report_lines))
+
         return {"mode": "all", "output_path": output_path, "timings": rows}
 
     row = _run_single_dataset(dataset_name, make_plots=True, emit_console=True)
@@ -688,13 +637,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", default="diabetes", help="Dataset name or 'all'.")
     parser.add_argument("--mode", choices=["single", "all"], default="single", help="Run one dataset or all datasets.")
     parser.add_argument("--output", action="store_true", help="Write report to Output directory.")
-    parser.add_argument("--plot-report", default=None, help="Generate plots from an existing report file and exit.")
     args = parser.parse_args()
-
-    if args.plot_report:
-        generate_plots_from_report(args.plot_report)
-        print("Plots generated from report and saved in Output directory.")
-        raise SystemExit(0)
 
     run_all = args.mode == "all" or str(args.dataset).strip().lower() == "all"
     output_path = None

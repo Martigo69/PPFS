@@ -1,0 +1,34 @@
+PPFS Benchmark Report
+Generated at: 2026-03-27T18:52:33
+
+Timing Summary
+Dataset | Spearman Preprocess (s) | Enc Spearman Compute (s) | MI Preprocess (s) | Enc MI Compute (s)
+--------+-------------------------+--------------------------+-------------------+-------------------
+rice    | 4353.315                | 14.531                   | 19012.686         | 103.342           
+
+=== Dataset: rice ===
+Dataset: rice
+Parties: 2
+Threshold: 2
+Rows: 3810
+Columns: 8
+Target Column: Class
+
+Target Feature (Spearman): Extent
+Feature                  Plain                 Encrypted
+Area                     -0.08041594358392996  -0.08041594358393007
+Perimeter                -0.15220650963853488  -0.15220650963853488
+Major_Axis_Length        -0.1650113749731882   -0.16501137497318813
+Minor_Axis_Length        0.06338762121752373   0.0633876212175235
+Eccentricity             -0.2298873768922656   -0.22988737689226565
+Convex_Area              -0.08532944203563152  -0.08532944203563156
+
+Mutual Information (target=Class)
+Feature                  Plain                 Encrypted
+Area                     0.5525615473468739    0.5525615473468739
+Perimeter                0.668528849849102     0.668528849849102
+Major_Axis_Length        0.7088347073552836    0.7088347073552836
+Minor_Axis_Length        0.1076946379601052    0.1076946379601052
+Eccentricity             0.31425659801825245   0.31425659801825245
+Convex_Area              0.5564634099482588    0.5564634099482588
+Extent                   0.05486028555009341   0.05486028555009341
