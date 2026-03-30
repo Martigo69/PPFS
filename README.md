@@ -56,9 +56,9 @@ The pipeline runs these high-level stages:
 4. Reporting
 - Prints plain vs encrypted result tables
 - Prints timing table with:
-  - Spearman preprocess
+  - Spearman preprocess (includes shared setup: key setup, dataset load, target-feature selection)
   - Encrypted Spearman compute
-  - MI preprocess
+  - MI preprocess (includes shared setup: key setup, dataset load, target-feature selection)
   - Encrypted MI compute
 - In file output mode, writes a report with dataset metadata and metric tables
 
@@ -99,11 +99,6 @@ All datasets + write report to `Output/`:
 python PPFS_Optimized.py --dataset all --mode all --output
 ```
 
-Generate plots later from an existing report (without recomputing encrypted metrics):
-```bash
-python PPFS_Optimized.py --plot-report Output/ppfs_all_datasets_report_YYYYMMDD_HHMMSS.txt
-```
-
 ## Output Files
 When `--output` is used, report files are written to `Output/`:
 - Single mode: `ppfs_<dataset>_report_<timestamp>.txt`
@@ -112,6 +107,8 @@ When `--output` is used, report files are written to `Output/`:
 Plots are written to `Output/`:
 - Spearman: `plot_spearman_<dataset>_<timestamp>.png`
 - MI: `plot_mi_<dataset>_<timestamp>.png`
+
+Plot generation is performed during normal dataset runs; the report-file plotting CLI path has been removed.
 
 ## Dependencies
 Install these Python packages before running:
