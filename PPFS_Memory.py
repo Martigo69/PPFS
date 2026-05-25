@@ -9,14 +9,56 @@ import time
 import os
 import argparse
 from datetime import datetime
+import psutil
+import threading
 
 gmpy2.get_context().precision = 100
+
+# Get current process for memory tracking
+_process = psutil.Process(os.getpid())
+MEMORY_SAMPLING_INTERVAL_S = 1.0
+
+def _get_memory_mb():
+    """Get current process memory usage in MB."""
+    return _process.memory_info().rss / (1024 * 1024)
 
 def _measure(func, *args, **kwargs):
     """Run a function and return (result, seconds)."""
     start = time.perf_counter()
     result = func(*args, **kwargs)
     return result, (time.perf_counter() - start)
+
+def _measure_with_memory(func, *args, **kwargs):
+    """Run a function and return (result, seconds, peak_memory_mb, start_memory_mb).
+    
+    Continuously monitors memory during execution to find true peak.
+    """
+    peak_memory = [_get_memory_mb()]  # Use list to allow modification in thread
+    start_memory = peak_memory[0]
+    monitoring = [True]  # Flag to stop monitoring thread
+    
+    def monitor_memory():
+        """Background thread that continuously samples memory."""
+        while monitoring[0]:
+            current_mem = _get_memory_mb()
+            if current_mem > peak_memory[0]:
+                peak_memory[0] = current_mem
+            time.sleep(MEMORY_SAMPLING_INTERVAL_S)  # Sample every 1 second
+    
+    # Start monitoring thread
+    monitor_thread = threading.Thread(target=monitor_memory, daemon=True)
+    monitor_thread.start()
+    
+    # Execute function
+    start = time.perf_counter()
+    result = func(*args, **kwargs)
+    elapsed = time.perf_counter() - start
+    
+    # Stop monitoring
+    monitoring[0] = False
+    monitor_thread.join(timeout=1.0)
+    
+    return result, elapsed, peak_memory[0], start_memory
 
 # =====================================================================
 # Configuration
@@ -491,21 +533,34 @@ def _run_single_dataset(dataset_name, make_plots=True, emit_console=True):
         "",
     ]
 
-    # Spearman preprocess
+    # Spearman preprocess with memory tracking
     spearman_preprocess_start = time.perf_counter()
     ranked_parts = compute_ranks(data_parts, target_col)
     squared_ranks = compute_squared_ranks(ranked_parts)
-    enc_ranked_parts = encrypt_data_parts(ranked_parts, system)
-    enc_squared_parts = encrypt_data_parts(squared_ranks, system)
+    enc_ranked_parts, _, enc_ranked_peak_mem, _ = _measure_with_memory(
+        encrypt_data_parts,
+        ranked_parts,
+        system
+    )
+    enc_squared_parts, _, enc_squared_peak_mem, _ = _measure_with_memory(
+        encrypt_data_parts,
+        squared_ranks,
+        system
+    )
     spearman_preprocess_s = shared_preprocess_s + (time.perf_counter() - spearman_preprocess_start)
+    spearman_preprocess_peak_mem = max(enc_ranked_peak_mem, enc_squared_peak_mem)
 
     mi_preprocess_start = time.perf_counter()
-    enc_mi_indicators = precompute_encrypted_mi_indicators(data_parts, target_col, system)
+    enc_mi_indicators, mi_preprocess_measure_s, mi_preprocess_peak_mem, _ = _measure_with_memory(
+        precompute_encrypted_mi_indicators,
+        data_parts,
+        target_col,
+        system
+    )
     mi_preprocess_s = shared_preprocess_s + (time.perf_counter() - mi_preprocess_start)
     
-    # Spearman computation
     plain_spearman = compute_spearman_correlation(ranked_parts, target_feature)
-    enc_spearman, enc_spearman_s = _measure(
+    enc_spearman, enc_spearman_s_result, enc_spearman_peak_mem, _ = _measure_with_memory(
         compute_encrypted_spearman_correlation,
         enc_ranked_parts,
         enc_squared_parts,
@@ -513,15 +568,17 @@ def _run_single_dataset(dataset_name, make_plots=True, emit_console=True):
         target_feature,
         system,
     )
+    enc_spearman_s = enc_spearman_s_result
 
     plain_mi = compute_mutual_information(data_parts, target_col)
-    enc_mi, enc_mi_s = _measure(
+    enc_mi, enc_mi_s_result, enc_mi_peak_mem, _ = _measure_with_memory(
         compute_encrypted_mutual_information,
         data_parts,
         target_col,
         system,
         enc_mi_indicators,
     )
+    enc_mi_s = enc_mi_s_result
 
     spearman_text = _format_spearman_results(target_feature, plain_spearman, enc_spearman)
     mi_text = _format_mutual_info_results(target_col, plain_mi, enc_mi)
@@ -533,19 +590,34 @@ def _run_single_dataset(dataset_name, make_plots=True, emit_console=True):
         print("\n" + mi_text)
         if make_plots:
             plot_mi(enc_mi, f"Encrypted MI (Dataset={dataset_name}, Target={target_col})", dataset_name)
+        print(f"\n=== Memory Usage ===")
+        print(f"Spearman Preprocess Peak: {spearman_preprocess_peak_mem:.2f} MB")
+        print(f"Enc Spearman Peak: {enc_spearman_peak_mem:.2f} MB")
+        print(f"MI Preprocess Peak: {mi_preprocess_peak_mem:.2f} MB")
+        print(f"Enc MI Peak: {enc_mi_peak_mem:.2f} MB")
 
     return {
         "dataset": dataset_name,
         "spearman_preprocess_s": spearman_preprocess_s,
+        "spearman_preprocess_peak_mem": spearman_preprocess_peak_mem,
         "enc_spearman_s": enc_spearman_s,
+        "enc_spearman_peak_mem": enc_spearman_peak_mem,
         "mi_preprocess_s": mi_preprocess_s,
+        "mi_preprocess_peak_mem": mi_preprocess_peak_mem,
         "enc_mi_s": enc_mi_s,
+        "enc_mi_peak_mem": enc_mi_peak_mem,
         "details": [
             f"=== Dataset: {dataset_name} ===",
             *dataset_info_lines,
             spearman_text,
             "",
             mi_text,
+            "",
+            f"=== Memory Usage ===",
+            f"Spearman Preprocess Peak: {spearman_preprocess_peak_mem:.2f} MB",
+            f"Enc Spearman Peak: {enc_spearman_peak_mem:.2f} MB",
+            f"MI Preprocess Peak: {mi_preprocess_peak_mem:.2f} MB",
+            f"Enc MI Peak: {enc_mi_peak_mem:.2f} MB",
             "",
         ],
     }
@@ -580,7 +652,7 @@ def main(dataset_name='diabetes', run_all=False, output_path=None):
     if selected_all:
         if output_path is None:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = f"ppfs_all_datasets_report_{ts}.txt"
+            output_path = f"ppfs_all_datasets_report_memory_{ts}.txt"
 
         rows = []
         details_blocks = []
@@ -588,9 +660,9 @@ def main(dataset_name='diabetes', run_all=False, output_path=None):
 
         # Create the report file early so progress is visible while long runs are in progress.
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write("PPFS Benchmark Report\n")
+            f.write("PPFS Benchmark Report (with Memory Profiling)\n")
             f.write(f"Generated at: {datetime.now().isoformat(timespec='seconds')}\n\n")
-            f.write("Timing Summary\n")
+            f.write("Timing and Memory Summary\n")
             f.write("(in progress)\n\n")
 
         for idx, name in enumerate(dataset_names, start=1):
@@ -600,10 +672,10 @@ def main(dataset_name='diabetes', run_all=False, output_path=None):
 
             table = _format_timing_table(rows)
             report_lines = [
-                "PPFS Benchmark Report",
+                "PPFS Benchmark Report (with Memory Profiling)",
                 f"Generated at: {datetime.now().isoformat(timespec='seconds')}",
                 "",
-                "Timing Summary",
+                "Timing and Memory Summary",
                 table,
                 "",
                 f"Progress: {idx}/{len(dataset_names)} datasets completed",
@@ -618,16 +690,16 @@ def main(dataset_name='diabetes', run_all=False, output_path=None):
         return {"mode": "all", "output_path": output_path, "timings": rows}
 
     row = _run_single_dataset(dataset_name, make_plots=True, emit_console=True)
-    print("\nTiming Summary")
+    print("\nTiming and Memory Summary")
     timing_table = _format_timing_table([row])
     print(timing_table)
 
     if output_path is not None:
         report_lines = [
-            "PPFS Benchmark Report",
+            "PPFS Benchmark Report (with Memory Profiling)",
             f"Generated at: {datetime.now().isoformat(timespec='seconds')}",
             "",
-            "Timing Summary",
+            "Timing and Memory Summary",
             timing_table,
             "",
         ]
@@ -639,7 +711,7 @@ def main(dataset_name='diabetes', run_all=False, output_path=None):
     return {"mode": "single", "timings": [row]}
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PPFS runner with timing summary.")
+    parser = argparse.ArgumentParser(description="PPFS runner with timing and memory profiling.")
     parser.add_argument("--dataset", default="diabetes", help="Dataset name or 'all'.")
     parser.add_argument("--mode", choices=["single", "all"], default="single", help="Run one dataset or all datasets.")
     parser.add_argument("--output", action="store_true", help="Write report to Output directory.")
@@ -651,10 +723,10 @@ if __name__ == "__main__":
         os.makedirs("Output", exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         if run_all:
-            output_path = os.path.join("Output", f"ppfs_all_datasets_report_{ts}.txt")
+            output_path = os.path.join("Output", f"ppfs_all_datasets_report_memory_{ts}.txt")
         else:
             dataset_tag = str(args.dataset).strip().lower().replace(" ", "_")
-            output_path = os.path.join("Output", f"ppfs_{dataset_tag}_report_{ts}.txt")
+            output_path = os.path.join("Output", f"ppfs_{dataset_tag}_report_memory_{ts}.txt")
 
     result = main(dataset_name=args.dataset, run_all=run_all, output_path=output_path)
 

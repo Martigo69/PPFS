@@ -125,3 +125,4 @@ pip install numpy pandas gmpy2 matplotlib
 ## Notes
 - Encrypted and plain results are expected to match up to tiny floating-point differences.
 - All-dataset runs can take many hours, especially for MI preprocessing and encrypted MI computation.
+- `submit_beans_delftblue.sh` is a local DelftBlue helper script and is ignored by git so the repository only tracks the core PPFS code and documentation.
